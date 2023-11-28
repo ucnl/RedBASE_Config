@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Diagnostics;
 using System.IO.Ports;
+using System.Text;
 using System.Windows.Forms;
 using UCNLDrivers;
 using UCNLNMEA;
@@ -11,6 +12,16 @@ namespace RedBASE_Config
     {
         #region Custom enums
 
+        enum UCNL_SRV_CMD
+        {
+            DEV_INFO_GET = 0,
+            FW_UPDATE_INVOKE = 1,
+            DEV_INFO_VAL = 2,
+            NAK = 3,
+            ACK = 4,
+            UNKNOWN
+        }
+      
         enum AppState
         {
             PORT_ABSENT,
@@ -19,10 +30,10 @@ namespace RedBASE_Config
             PORT_CLOSED,
             DEV_INFO_QUERIED,
             DEV_INFO_RECEIVED,
+            DEV_INFO_QUERIED_UCNL,
+            DEV_INFO_RECEIVED_UCNL,
             DEV_TIMEOUT,            
             WRONG_DEVICE,
-            DEV_SETTINGS_QUERIED,
-            DEV_SETTINGS_RECEIVED,
             DEV_SETTINGS_APPLY_QUERIED,
             DEV_SETTINGS_UPDATED,
             INVALID
@@ -36,15 +47,7 @@ namespace RedBASE_Config
             REDBASE_ADDR_4 = 3,
             REDBASE_ADDR_INVALID
         }
-
-        enum LOC_DATA_INFO
-        {
-            LOC_DATA_DEVICE_INFO        = 0,
-            LOC_DATA_MAX_SUBSCRIBERS    = 2,
-            LOC_DATA_PRESSURE_RATING    = 6,
-            LOC_DATA_UNKNOWN
-        }
-
+    
         enum LOC_ERR
         {
             LOC_ERR_NO_ERROR = 0,
@@ -56,7 +59,10 @@ namespace RedBASE_Config
             LOC_ERR_UNKNOWN_FIELD_ID = 6,
             LOC_ERR_VALUE_UNAVAILIBLE = 7,
             LOC_ERR_RECEIVER_BUSY = 8,
-            LOC_ERR_INVALID
+            LOC_ERR_TX_BUFFER_OVERRUN = 9,
+            LOC_ERR_CHKSUM_ERROR = 10,
+            LOC_ERR_UNKNOWN
+
         }
 
         enum DEV_TYPE
@@ -66,7 +72,7 @@ namespace RedBASE_Config
             DEV_REDNAV = 2,  
             DEV_REDGTR = 3,  
             DEV_UNKNOWN
-        }
+        }        
 
         #endregion
 
@@ -134,15 +140,22 @@ namespace RedBASE_Config
 
                 #region NMEA
 
-                NMEAParser.AddManufacturerToProprietarySentencesBase(ManufacturerCodes.TNT);
-                NMEAParser.AddProprietarySentenceDescription(ManufacturerCodes.TNT, "0", "x");   // ACK $PTNT0,errCode
-                NMEAParser.AddProprietarySentenceDescription(ManufacturerCodes.TNT, "4", "x,x"); // LOC_DATA_GET $PTNT4,dataID,reserved
-                NMEAParser.AddProprietarySentenceDescription(ManufacturerCodes.TNT, "5", "x,x"); // LOC_DATA_VAL $PTNT5,dataID,dataVal
-                NMEAParser.AddProprietarySentenceDescription(ManufacturerCodes.TNT, "!", "c--c,x,c--c,x,x,c--c"); // DEV_INFO $PTNT!,sys_moniker,sys_ver,dev_type,core_moniker,core_ver,dev_serial_num
-                NMEAParser.AddProprietarySentenceDescription(ManufacturerCodes.TNT, "7", "x");   // SETTINGS_GET $PTNT7,reserved
-                NMEAParser.AddProprietarySentenceDescription(ManufacturerCodes.TNT, "8", "x,x"); // SETTINGS_SET $PTNT8,buoyAddr,isInverted
-                NMEAParser.AddProprietarySentenceDescription(ManufacturerCodes.TNT, "9", "x,x"); // SETTINGS_VAL $PTNT9,buoyAddr,isInverted
+                NMEAParser.AddManufacturerToProprietarySentencesBase(ManufacturerCodes.RWE);
 
+                //
+                //#define IC_D2H_ACK              '0'        // $PRWE0,cmdID,errCode
+                //#define IC_H2D_SETTINGS_WRITE   '1'        // $PRWE1,buoyAddress
+                //#define IC_H2D_DINFO_GET        '?'        // $PRWE?,reserved
+                //#define IC_D2H_DINFO            '!'        // $PRWE!,deviceType,dev_string [prm=val:param=val...]
+
+                NMEAParser.AddProprietarySentenceDescription(ManufacturerCodes.RWE, "0", "x,x"); // 
+                NMEAParser.AddProprietarySentenceDescription(ManufacturerCodes.RWE, "1", "x");   // 
+                NMEAParser.AddProprietarySentenceDescription(ManufacturerCodes.RWE, "?", "x");   // 
+                NMEAParser.AddProprietarySentenceDescription(ManufacturerCodes.RWE, "!", "x,c--c");   //              
+
+                NMEAParser.AddManufacturerToProprietarySentencesBase(ManufacturerCodes.UCN);
+                NMEAParser.AddProprietarySentenceDescription(ManufacturerCodes.UCN, "L", "x,x,c--c");
+                  
                 #endregion
 
                 #region timer
@@ -174,31 +187,66 @@ namespace RedBASE_Config
             {
                 State = AppState.PORT_ABSENT;
             }
-
         }
 
         #endregion
        
-        #region Methods    
+        #region Methods
 
         #region Parsers
 
-        private void DEVICE_INFO_Parse(object[] parameters)
+        private void PUCNL_Parse(object[] parameters)
         {
-            //sys_moniker,sys_ver,core_moniker,core_ver,dev_type,dev_serial_num
-            string sys_moniker = (string)parameters[0];
-            int sys_ver = (int)parameters[1];            
-            string core_moniker = (string)parameters[2];
-            int core_ver = (int)parameters[3];
-            DEV_TYPE devType = (DEV_TYPE)(int)parameters[4];
-            string dev_serial_num = (string)parameters[5];
+            UCNL_SRV_CMD svcCmd = (UCNL_SRV_CMD)Enum.ToObject(typeof(UCNL_SRV_CMD), (int)parameters[0]);
 
-            serialTxb.Invoke((MethodInvoker)delegate { serialTxb.Text = dev_serial_num; });
+            if (svcCmd == UCNL_SRV_CMD.DEV_INFO_VAL)
+            {
+                string dString = (string)parameters[2];
+                var splits = dString.Split("-".ToCharArray(), StringSplitOptions.RemoveEmptyEntries);
+                serialTxb.Invoke((MethodInvoker)delegate { serialTxb.Text = splits[splits.Length - 1]; });
+                State = AppState.DEV_INFO_RECEIVED_UCNL;
+            }
+            else
+            {
+                State = AppState.PORT_ERROR;
+            }
+        }
+
+        private void DEVICE_INFO_Parse(object[] parameters)
+        {                                   
+            string cm = "";
+            string cv = "";
+
+            DEV_TYPE devType = (DEV_TYPE)(int)parameters[0];
+            string dString = (string)parameters[1];
+
+            var splits = dString.Split(":".ToCharArray(), StringSplitOptions.RemoveEmptyEntries);
+
+            foreach (var item in splits)
+            {
+                var splts = item.Split("=".ToCharArray(), StringSplitOptions.RemoveEmptyEntries);
+
+                if (splts.Length == 2)
+                {
+                    if (splts[0] == "BADDR")
+                    {
+                        Invoke((MethodInvoker)delegate { BuoyAddr = (RedBASE_Addr)Enum.ToObject(typeof(RedBASE_Addr), Convert.ToInt32(splts[1])); });
+                    }
+                    else if (splts[0] == "CM")
+                    {
+                        cm = splts[1];
+                    }
+                    else if (splts[0] == "CV")
+                    {
+                        cv = splts[1];
+                    }
+                }
+            }
+            
 
             deviceInfoTxb.Invoke((MethodInvoker)delegate
             {
-                deviceInfoTxb.Text = string.Format("System: {0} v.{1}, Core: {2} v.{3}, Device: {4}",
-                    sys_moniker, BCDVersionToStr(sys_ver), core_moniker, BCDVersionToStr(core_ver), devType);
+                deviceInfoTxb.Text = string.Format("{0} {1}", devType, cm, cv);
             });
 
             if (devType != DEV_TYPE.DEV_REDBASE)
@@ -213,7 +261,7 @@ namespace RedBASE_Config
 
         private void ACK_Parse(object[] parameters)
         {
-            LOC_ERR errCode = (LOC_ERR)(int)parameters[0];
+            LOC_ERR errCode = (LOC_ERR)(int)parameters[1];
 
             if (errCode == LOC_ERR.LOC_ERR_NO_ERROR)
             {
@@ -224,18 +272,7 @@ namespace RedBASE_Config
             {
                 State = AppState.PORT_ERROR;
             }
-        }
-                  
-        private void LOC_DATA_VAL_Parse(object[] parameters)
-        {
-            //
-        }
-
-        private void SETTINGS_VAL_Parse(object[] parameters)
-        {
-            buoyAddrCbx.Invoke((MethodInvoker)delegate { BuoyAddr = (RedBASE_Addr)(int)parameters[0]; });
-            State = AppState.DEV_SETTINGS_RECEIVED;
-        }
+        }      
 
         #endregion
 
@@ -282,7 +319,7 @@ namespace RedBASE_Config
                     buoyAddressGroup.Enabled = false;
                     statusLbl.Text = "Port opened";
 
-                    var message = NMEAParser.BuildProprietarySentence(ManufacturerCodes.TNT, "4", new object[] { LOC_DATA_INFO.LOC_DATA_DEVICE_INFO, 0 });
+                    var message = NMEAParser.BuildProprietarySentence(ManufacturerCodes.RWE, "?", new object[] { 0 });
                     if (!TrySend(message))
                         State = AppState.PORT_CLOSED;
                     else
@@ -324,15 +361,14 @@ namespace RedBASE_Config
                 {
                     if (timer.IsRunning)
                         timer.Stop();
-
-                    deviceInfoGroup.Enabled = true;                    
+                                     
                     statusLbl.Text = "Device info received";
 
-                    string message = NMEAParser.BuildProprietarySentence(ManufacturerCodes.TNT, "7", new object[] { 0 });
+                    string message = NMEAParser.BuildProprietarySentence(ManufacturerCodes.UCN, "L", new object[] { UCNL_SRV_CMD.DEV_INFO_GET, 0 });                    
 
                     if (TrySend(message))
                     {
-                        State = AppState.DEV_SETTINGS_QUERIED;
+                        State = AppState.DEV_INFO_QUERIED_UCNL;
                         timer.Start();       
                     }
                     else
@@ -340,6 +376,22 @@ namespace RedBASE_Config
                         State = AppState.PORT_ERROR;
                     }
 
+                    break;
+                }
+                case AppState.DEV_INFO_QUERIED_UCNL:
+                {
+                    statusLbl.Text = "Device info queried (SVC)...";
+                    timer.Start();
+                    break;
+                }
+                case AppState.DEV_INFO_RECEIVED_UCNL:
+                {
+                    if (timer.IsRunning)
+                        timer.Stop();
+
+                    deviceInfoGroup.Enabled = true;
+                    buoyAddressGroup.Enabled = true;
+                    statusLbl.Text = "Device info received";
                     break;
                 }
                 case AppState.DEV_TIMEOUT:
@@ -355,21 +407,7 @@ namespace RedBASE_Config
                     buoyAddressGroup.Enabled = false;
                     statusLbl.Text = "Connected device is not a RedBASE";
                     break;
-                }
-                case AppState.DEV_SETTINGS_QUERIED:
-                {                    
-                    statusLbl.Text = "Settings queried...";
-                    break;
-                }
-                case AppState.DEV_SETTINGS_RECEIVED:
-                {
-                    if (timer.IsRunning)
-                        timer.Stop();
-
-                    buoyAddressGroup.Enabled = true;
-                    statusLbl.Text = "Settings received";
-                    break;
-                }
+                }                
                 case AppState.DEV_SETTINGS_APPLY_QUERIED:
                 {
                     statusLbl.Text = "Settings apply queried...";
@@ -391,7 +429,6 @@ namespace RedBASE_Config
             }
         }
         
-
         #endregion
 
         #region Handlers
@@ -408,7 +445,7 @@ namespace RedBASE_Config
                 {
                     NMEAProprietarySentence sentence = (parseResult as NMEAProprietarySentence);
 
-                    if (sentence.Manufacturer == ManufacturerCodes.TNT)
+                    if (sentence.Manufacturer == ManufacturerCodes.RWE)
                     {
                         if (sentence.SentenceIDString == "!")
                         {
@@ -419,21 +456,12 @@ namespace RedBASE_Config
                         {
                             // ACK
                             ACK_Parse(sentence.parameters);
-                        }
-                        else if (sentence.SentenceIDString == "5")
-                        {
-                            // LOC_DATA_VAL
-                            LOC_DATA_VAL_Parse(sentence.parameters);
-                        }
-                        else if (sentence.SentenceIDString == "9")
-                        {
-                            // SETTINGS_VAL
-                            SETTINGS_VAL_Parse(sentence.parameters);
-                        }
+                        }                        
                     }
-                    else
+                    else if ((sentence.Manufacturer == ManufacturerCodes.UCN) &&
+                        (sentence.SentenceIDString == "L"))
                     {
-                        // WTF?
+                        PUCNL_Parse(sentence.parameters);
                     }
                 }             
             }
@@ -506,7 +534,7 @@ namespace RedBASE_Config
 
         private void applyBuoyAddrBtn_Click(object sender, EventArgs e)
         {
-            string message = NMEAParser.BuildProprietarySentence(ManufacturerCodes.TNT, "8", new object[] { BuoyAddr, 0 });
+            string message = NMEAParser.BuildProprietarySentence(ManufacturerCodes.RWE, "1", new object[] { BuoyAddr });
 
             if (TrySend(message))
             {
